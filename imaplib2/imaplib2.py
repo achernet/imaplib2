@@ -17,9 +17,9 @@ Public functions: Internaldate2Time
 __all__ = ("IMAP4", "IMAP4_SSL", "IMAP4_stream",
            "Internaldate2Time", "ParseFlags", "Time2Internaldate")
 
-__version__ = "2.45"
+__version__ = "2.52"
 __release__ = "2"
-__revision__ = "45"
+__revision__ = "52"
 __credits__ = """
 Authentication code contributed by Donn Cave <donn@u.washington.edu> June 1998.
 String method conversion by ESR, February 2001.
@@ -47,20 +47,26 @@ Fix for missing idle_lock in _handler() provided by Franklin Brook <franklin@bro
 Conversion to Python3 provided by F. Malina <fmalina@gmail.com> February 2015.
 Fix for READ-ONLY error from multiple EXAMINE/SELECT calls by Pierre-Louis Bonicoli <pierre-louis.bonicoli@gmx.fr> March 2015.
 Fix for null strings appended to untagged responses by Pierre-Louis Bonicoli <pierre-louis.bonicoli@gmx.fr> March 2015.
-Fix for correct byte encoding for _CRAM_MD5_AUTH taken from python3.5 imaplib.py June 2015."""
+Fix for correct byte encoding for _CRAM_MD5_AUTH taken from python3.5 imaplib.py June 2015.
+Fix for correct Python 3 exception handling by Tobias Brink <tobias.brink@gmail.com> August 2015.
+Fix to allow interruptible IDLE command by Tim Peoples <dromedary512@users.sf.net> September 2015.
+Add support for TLS levels by Ben Boeckel <mathstuf@gmail.com> September 2015.
+Fix for shutown exception by Sebastien Gross <seb@chezwam.org> November 2015."""
 __author__ = "Piers Lauder <piers@janeelix.com>"
 __URL__ = "http://imaplib2.sourceforge.net"
 __license__ = "Python License"
 
 import binascii, errno, os, random, re, select, socket, sys, time, threading, zlib
 
-try:
-    import queue # py3
+if bytes != str:
+    # Python 3, but NB assumes strings in all I/O
+    # for backwards compatibility with python 2 usage.
+    import queue
     string_types = str
-except ImportError:
-    import Queue as queue # py2
+else:
+    import Queue as queue
     string_types = basestring
-
+    threading.TIMEOUT_MAX = 9223372036854.0
 
 select_module = select
 
@@ -77,6 +83,10 @@ READ_POLL_TIMEOUT = 30                          # Without this timeout interrupt
 READ_SIZE = 32768                               # Consume all available in socket
 
 DFLT_DEBUG_BUF_LVL = 3                          # Level above which the logging output goes directly to stderr
+
+TLS_SECURE = "tls_secure"                       # Recognised TLS levels
+TLS_NO_SSL = "tls_no_ssl"
+TLS_COMPAT = "tls_compat"
 
 AllowedVersions = ('IMAP4REV1', 'IMAP4')        # Most recent first
 
@@ -180,7 +190,7 @@ class Request(object):
     def get_response(self, exc_fmt=None):
         self.callback = None
         if __debug__: self.parent._log(3, '%s:%s.ready.wait' % (self.name, self.tag))
-        self.ready.wait()
+        self.ready.wait(threading.TIMEOUT_MAX)
 
         if self.aborted is not None:
             typ, val = self.aborted
@@ -320,6 +330,7 @@ class IMAP4(object):
 
         self.compressor = None          # COMPRESS/DEFLATE if not None
         self.decompressor = None
+        self._tls_established = False
 
         # Create unique tag for this session,
         # and compile tagged response matcher.
@@ -381,7 +392,7 @@ class IMAP4(object):
         # request and store CAPABILITY response.
 
         try:
-            self.welcome = self._request_push(tag='continuation').get_response('IMAP4 protocol error: %s')[1]
+            self.welcome = self._request_push(name='welcome', tag='continuation').get_response('IMAP4 protocol error: %s')[1]
 
             if self._get_untagged_response('PREAUTH'):
                 self.state = AUTH
@@ -442,19 +453,22 @@ class IMAP4(object):
             af, socktype, proto, canonname, sa = res
             try:
                 s = socket.socket(af, socktype, proto)
-            except socket.error as msg:
+            except socket.error as m:
+                msg = m
                 continue
             try:
                 for i in (0, 1):
                     try:
                         s.connect(sa)
                         break
-                    except socket.error as msg:
+                    except socket.error as m:
+                        msg = m
                         if len(msg.args) < 2 or msg.args[0] != errno.EINTR:
                             raise
                 else:
                     raise socket.error(msg)
-            except socket.error as msg:
+            except socket.error as m:
+                msg = m
                 s.close()
                 continue
             break
@@ -466,39 +480,59 @@ class IMAP4(object):
 
     def ssl_wrap_socket(self):
 
-        # Allow sending of keep-alive messages - seems to prevent some servers
-        # from closing SSL, leading to deadlocks.
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
         try:
             import ssl
+
+            TLS_MAP = {}
+            if hasattr(ssl, "PROTOCOL_TLSv1_2"):        # py3
+                TLS_MAP[TLS_SECURE] = {
+                    "tls1_2": ssl.PROTOCOL_TLSv1_2,
+                    "tls1_1": ssl.PROTOCOL_TLSv1_1,
+                }
+            else:
+                TLS_MAP[TLS_SECURE] = {}
+            TLS_MAP[TLS_NO_SSL] = TLS_MAP[TLS_SECURE].copy()
+            TLS_MAP[TLS_NO_SSL].update({
+                "tls1": ssl.PROTOCOL_TLSv1,
+            })
+            TLS_MAP[TLS_COMPAT] = TLS_MAP[TLS_NO_SSL].copy()
+            TLS_MAP[TLS_COMPAT].update({
+                "ssl23": ssl.PROTOCOL_SSLv23,
+                None: ssl.PROTOCOL_SSLv23,
+            })
+            if hasattr(ssl, "PROTOCOL_SSLv3"):          # Might not be available.
+                TLS_MAP[TLS_COMPAT].update({
+                    "ssl3": ssl.PROTOCOL_SSLv3
+                })
+
             if self.ca_certs is not None:
                 cert_reqs = ssl.CERT_REQUIRED
             else:
                 cert_reqs = ssl.CERT_NONE
 
-            if self.ssl_version == "tls1":
-                ssl_version = ssl.PROTOCOL_TLSv1
-            elif self.ssl_version == "ssl2":
-                ssl_version = ssl.PROTOCOL_SSLv2
-            elif self.ssl_version == "ssl3":
-                ssl_version = ssl.PROTOCOL_SSLv3
-            elif self.ssl_version == "ssl23" or self.ssl_version is None:
-                ssl_version = ssl.PROTOCOL_SSLv23
-            else:
-                raise socket.sslerror("Invalid SSL version requested: %s", self.ssl_version)
+            if self.tls_level not in TLS_MAP:
+                raise RuntimeError("unknown tls_level: %s" % self.tls_level)
+
+            if self.ssl_version not in TLS_MAP[self.tls_level]:
+                raise socket.sslerror("Invalid SSL version '%s' requested for tls_version '%s'" % (self.ssl_version, self.tls_level))
+
+            ssl_version =  TLS_MAP[self.tls_level][self.ssl_version]
 
             self.sock = ssl.wrap_socket(self.sock, self.keyfile, self.certfile, ca_certs=self.ca_certs, cert_reqs=cert_reqs, ssl_version=ssl_version)
             ssl_exc = ssl.SSLError
             self.read_fd = self.sock.fileno()
         except ImportError:
             # No ssl module, and socket.ssl has no fileno(), and does not allow certificate verification
-            raise socket.sslerror("imaplib2 SSL mode does not work without ssl module")
+            raise socket.sslerror("imaplib SSL mode does not work without ssl module")
 
         if self.cert_verify_cb is not None:
             cert_err = self.cert_verify_cb(self.sock.getpeercert(), self.host)
             if cert_err:
                 raise ssl_exc(cert_err)
+
+        # Allow sending of keep-alive messages - seems to prevent some servers
+        # from closing SSL, leading to deadlocks.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
 
 
@@ -535,16 +569,23 @@ class IMAP4(object):
             data += self.compressor.flush(zlib.Z_SYNC_FLUSH)
 
         if bytes != str:
-            self.sock.sendall(bytes(data, 'utf8'))
-        else:
-            self.sock.sendall(data)
+            data = bytes(data, 'ASCII')
+
+        self.sock.sendall(data)
 
 
     def shutdown(self):
         """shutdown()
         Close I/O established in "open"."""
 
-        self.sock.close()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception as e:
+            # The server might already have closed the connection
+            if e.errno != errno.ENOTCONN:
+                raise
+        finally:
+            self.sock.close()
 
 
     def socket(self):
@@ -882,7 +923,7 @@ class IMAP4(object):
     def _CRAM_MD5_AUTH(self, challenge):
         """Authobject to use with CRAM-MD5 authentication."""
         import hmac
-        pwd = (self.password.encode('utf-8') if isinstance(self.password, str)
+        pwd = (self.password.encode('ASCII') if isinstance(self.password, str)
                                              else self.password)
         return self.user + " " + hmac.HMAC(pwd, challenge, 'md5').hexdigest()
 
@@ -1068,8 +1109,8 @@ class IMAP4(object):
         return self._simple_command(name, sort_criteria, charset, *search_criteria, **kw)
 
 
-    def starttls(self, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", **kw):
-        """(typ, [data]) = starttls(keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23")
+    def starttls(self, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", tls_level=TLS_COMPAT, **kw):
+        """(typ, [data]) = starttls(keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", tls_level="tls_compat")
         Start TLS negotiation as per RFC 2595."""
 
         name = 'STARTTLS'
@@ -1077,7 +1118,7 @@ class IMAP4(object):
         if name not in self.capabilities:
             raise self.abort('TLS not supported by server')
 
-        if hasattr(self, '_tls_established') and self._tls_established:
+        if self._tls_established:
             raise self.abort('TLS session already established')
 
         # Must now shutdown reader thread after next response, and restart after changing read_fd
@@ -1105,6 +1146,7 @@ class IMAP4(object):
         self.ca_certs = ca_certs
         self.cert_verify_cb = cert_verify_cb
         self.ssl_version = ssl_version
+        self.tls_level = tls_level
 
         try:
             self.ssl_wrap_socket()
@@ -1239,7 +1281,10 @@ class IMAP4(object):
 
         bye = self._get_untagged_response('BYE', leave=True)
         if bye:
-            raise self.abort(bye[-1])
+            if str != bytes:
+                raise self.abort(bye[-1].decode('ASCII', 'replace'))
+            else:
+                raise self.abort(bye[-1])
 
 
     def _checkquote(self, arg):
@@ -1300,13 +1345,13 @@ class IMAP4(object):
             self.commands_lock.release()
             if need_event:
                 if __debug__: self._log(3, 'sync command %s waiting for empty commands Q' % name)
-                self.state_change_free.wait()
+                self.state_change_free.wait(threading.TIMEOUT_MAX)
                 if __debug__: self._log(3, 'sync command %s proceeding' % name)
 
         if self.state not in Commands[name][CMD_VAL_STATES]:
             self.literal = None
-            raise self.error('command %s illegal in state %s'
-                                % (name, self.state))
+            raise self.error('command %s illegal in state %s, only allowed in states %s'
+                                % (name, self.state, ', '.join(Commands[name][CMD_VAL_STATES])))
 
         self._check_bye()
 
@@ -1351,7 +1396,7 @@ class IMAP4(object):
             return rqb
 
         # Must setup continuation expectancy *before* ouq.put 
-        crqb = self._request_push(tag='continuation')
+        crqb = self._request_push(name=name, tag='continuation')
 
         self.ouq.put(rqb)
 
@@ -1376,7 +1421,7 @@ class IMAP4(object):
 
             if literator is not None:
                 # Need new request for next continuation response
-                crqb = self._request_push(tag='continuation')
+                crqb = self._request_push(name=name, tag='continuation')
 
             if __debug__: self._log(4, 'write literal size %s' % len(literal))
             crqb.data = '%s%s' % (literal, CRLF)
@@ -1416,7 +1461,10 @@ class IMAP4(object):
             return
         bye = self._get_untagged_response('BYE', leave=True)
         if bye:
-            rqb.abort(self.abort, bye[-1])
+            if str != bytes:
+               rqb.abort(self.abort, bye[-1].decode('ASCII', 'replace'))
+            else:
+               rqb.abort(self.abort, bye[-1])
             return
         typ, dat = response
         if typ == 'BAD':
@@ -1772,7 +1820,10 @@ class IMAP4(object):
             }
             return ' '.join([PollErrors[s] for s in PollErrors.keys() if (s & state)])
 
-        line_part = ''
+        if bytes != str:
+            line_part = b''
+        else:
+            line_part = ''
 
         poll = select.poll()
 
@@ -1812,11 +1863,11 @@ class IMAP4(object):
                         if bytes != str:
                             stop = data.find(b'\n', start)
                             if stop < 0:
-                                line_part += data[start:].decode(errors='ignore')
+                                line_part += data[start:]
                                 break
                             stop += 1
                             line_part, start, line = \
-                                '', stop, line_part + data[start:stop].decode(errors='ignore')
+                                b'', stop, (line_part + data[start:stop]).decode(errors='ignore')
                         else:
                             stop = data.find('\n', start)
                             if stop < 0:
@@ -1856,7 +1907,10 @@ class IMAP4(object):
 
         if __debug__: self._log(1, 'starting using select')
 
-        line_part = ''
+        if bytes != str:
+            line_part = b''
+        else:
+            line_part = ''
 
         rxzero = 0
         terminate = False
@@ -1888,11 +1942,11 @@ class IMAP4(object):
                     if bytes != str:
                         stop = data.find(b'\n', start)
                         if stop < 0:
-                            line_part += data[start:].decode(errors='ignore')
+                            line_part += data[start:]
                             break
                         stop += 1
                         line_part, start, line = \
-                            '', stop, line_part + data[start:stop].decode(errors='ignore')
+                            b'', stop, (line_part + data[start:stop]).decode(errors='ignore')
                     else:
                         stop = data.find('\n', start)
                         if stop < 0:
@@ -2045,7 +2099,7 @@ class IMAP4_SSL(IMAP4):
     """IMAP4 client class over SSL connection
 
     Instantiate with:
-        IMAP4_SSL(host=None, port=None, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", debug=None, debug_file=None, identifier=None, timeout=None)
+        IMAP4_SSL(host=None, port=None, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", debug=None, debug_file=None, identifier=None, timeout=None, debug_buf_lvl=None, tls_level="tls_compat")
 
         host           - host's name (default: localhost);
         port           - port number (default: standard IMAP4 SSL port);
@@ -2053,23 +2107,30 @@ class IMAP4_SSL(IMAP4):
         certfile       - PEM formatted certificate chain file (default: None);
         ca_certs       - PEM formatted certificate chain file used to validate server certificates (default: None);
         cert_verify_cb - function to verify authenticity of server certificates (default: None);
-        ssl_version    - SSL version to use (default: "ssl23", choose from: "tls1","ssl2","ssl3","ssl23");
+        ssl_version    - SSL version to use (default: "ssl23", choose from: "tls1","ssl3","ssl23");
         debug          - debug level (default: 0 - no debug);
         debug_file     - debug stream (default: sys.stderr);
         identifier     - thread identifier prefix (default: host);
         timeout        - timeout in seconds when expecting a command response.
         debug_buf_lvl  - debug level at which buffering is turned off.
+        tls_level      - TLS security level (default: "tls_compat").
+
+    The recognized values for tls_level are:
+        tls_secure: accept only TLS protocols recognized as "secure"
+        tls_no_ssl: disable SSLv2 and SSLv3 support
+        tls_compat: accept all SSL/TLS versions
 
     For more documentation see the docstring of the parent class IMAP4.
     """
 
 
-    def __init__(self, host=None, port=None, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", debug=None, debug_file=None, identifier=None, timeout=None, debug_buf_lvl=None):
+    def __init__(self, host=None, port=None, keyfile=None, certfile=None, ca_certs=None, cert_verify_cb=None, ssl_version="ssl23", debug=None, debug_file=None, identifier=None, timeout=None, debug_buf_lvl=None, tls_level=TLS_COMPAT):
         self.keyfile = keyfile
         self.certfile = certfile
         self.ca_certs = ca_certs
         self.cert_verify_cb = cert_verify_cb
         self.ssl_version = ssl_version
+        self.tls_level = tls_level
         IMAP4.__init__(self, host, port, debug, debug_file, identifier, timeout, debug_buf_lvl)
 
 
@@ -2110,27 +2171,18 @@ class IMAP4_SSL(IMAP4):
             data += self.compressor.flush(zlib.Z_SYNC_FLUSH)
 
         if bytes != str:
-            if hasattr(self.sock, "sendall"):
-                self.sock.sendall(bytes(data, 'utf8'))
-            else:
-                dlen = len(data)
-                while dlen > 0:
-                    sent = self.sock.write(bytes(data, 'utf8'))
-                    if sent == dlen:
-                        break    # avoid copy
-                    data = data[sent:]
-                    dlen = dlen - sent
+            data = bytes(data, 'utf8')
+
+        if hasattr(self.sock, "sendall"):
+            self.sock.sendall(data)
         else:
-            if hasattr(self.sock, "sendall"):
-                self.sock.sendall(data)
-            else:
-                dlen = len(data)
-                while dlen > 0:
-                    sent = self.sock.write(data)
-                    if sent == dlen:
-                        break    # avoid copy
-                    data = data[sent:]
-                    dlen = dlen - sent
+            dlen = len(data)
+            while dlen > 0:
+                sent = self.sock.write(data)
+                if sent == dlen:
+                    break    # avoid copy
+                data = data[sent:]
+                dlen = dlen - sent
 
 
     def ssl(self):
@@ -2205,9 +2257,9 @@ class IMAP4_stream(IMAP4):
             data += self.compressor.flush(zlib.Z_SYNC_FLUSH)
 
         if bytes != str:
-            self.writefile.write(bytes(data, 'utf8'))
-        else:
-            self.writefile.write(data)
+            data = bytes(data, 'utf8')
+
+        self.writefile.write(data)
         self.writefile.flush()
 
 
@@ -2462,7 +2514,7 @@ if __name__ == '__main__':
     )
 
 
-    AsyncError = None
+    AsyncError, M = None, None
 
     def responder(cb_arg_list):
         response, cb_arg, error = cb_arg_list
@@ -2507,7 +2559,7 @@ if __name__ == '__main__':
         if keyfile is not None:
             if not keyfile: keyfile = None
             if not certfile: certfile = None
-            M = IMAP4_SSL(host=host, port=port, keyfile=keyfile, certfile=certfile, debug=debug, identifier='', timeout=10, debug_buf_lvl=debug_buf_lvl)
+            M = IMAP4_SSL(host=host, port=port, keyfile=keyfile, certfile=certfile, ssl_version="tls1", debug=debug, identifier='', timeout=10, debug_buf_lvl=debug_buf_lvl, tls_level="tls_no_ssl")
         elif stream_command:
             M = IMAP4_stream(stream_command, debug=debug, identifier='', timeout=10, debug_buf_lvl=debug_buf_lvl)
         else:
@@ -2585,7 +2637,7 @@ if __name__ == '__main__':
         print('All tests OK.')
 
     except:
-        if not idle_intr or not 'IDLE' in M.capabilities:
+        if not idle_intr or M is None or not 'IDLE' in M.capabilities:
             print('Tests failed.')
 
             if not debug:
